@@ -1,0 +1,185 @@
+import { Button, ComboBox, Slider, StandardButton, LineEdit, ScrollView, VerticalBox, HorizontalBox, GridBox } from "std-widgets.slint";
+
+export component PlayerWindow inherits Window {
+    title: "Audiophile Player";
+    preferred-width: 600px;
+    preferred-height: 400px;
+    background: #1a1a1a;
+    
+    // Callbacks
+    callback play();
+    callback pause();
+    callback stop();
+    callback load-file();
+    callback seek(float);
+    callback volume-changed(float);
+    callback device-changed(string);
+    
+    // Properties
+    in-out property <bool> is-playing: false;
+    in-out property <string> current-file: "No file loaded";
+    in-out property <string> file-info: "";
+    in-out property <float> position: 0.0;
+    in-out property <float> duration: 0.0;
+    in-out property <float> volume: 0.8;
+    in-out property <[string]> audio-devices: ["Default"];
+    in-out property <int> selected-device: 0;
+    in-out property <string> playback-info: "Stopped";
+    
+    VerticalBox {
+        padding: 20px;
+        spacing: 15px;
+        
+        // File info section
+        Rectangle {
+            background: #2a2a2a;
+            border-radius: 8px;
+            height: 80px;
+            
+            VerticalBox {
+                padding: 10px;
+                
+                Text {
+                    text: root.current-file;
+                    color: #ffffff;
+                    font-size: 14px;
+                    font-weight: 600;
+                    overflow: elide;
+                }
+                
+                Text {
+                    text: root.file-info;
+                    color: #888888;
+                    font-size: 12px;
+                }
+                
+                Text {
+                    text: root.playback-info;
+                    color: #00ff00;
+                    font-size: 11px;
+                    font-family: "monospace";
+                }
+            }
+        }
+        
+        // Progress bar
+        Rectangle {
+            height: 60px;
+            
+            VerticalBox {
+                Slider {
+                    value: root.position;
+                    maximum: root.duration;
+                    enabled: root.duration > 0;
+                    changed(value) => { root.seek(value); }
+                }
+                
+                HorizontalBox {
+                    Text {
+                        text: format-time(root.position);
+                        color: #cccccc;
+                        font-size: 11px;
+                        width: 50px;
+                    }
+                    
+                    Rectangle { }
+                    
+                    Text {
+                        text: format-time(root.duration);
+                        color: #cccccc;
+                        font-size: 11px;
+                        horizontal-alignment: right;
+                        width: 50px;
+                    }
+                }
+            }
+        }
+        
+        // Control buttons
+        HorizontalBox {
+            spacing: 10px;
+            alignment: center;
+            
+            Button {
+                text: "Load File";
+                clicked => { root.load-file(); }
+                primary: true;
+            }
+            
+            Button {
+                text: root.is-playing ? "⏸" : "▶";
+                width: 60px;
+                clicked => { 
+                    if (root.is-playing) {
+                        root.pause();
+                    } else {
+                        root.play();
+                    }
+                }
+                enabled: root.current-file != "No file loaded";
+            }
+            
+            Button {
+                text: "⏹";
+                width: 60px;
+                clicked => { root.stop(); }
+                enabled: root.current-file != "No file loaded";
+            }
+        }
+        
+        // Device and volume controls
+        GridBox {
+            Row {
+                Text {
+                    text: "Output Device:";
+                    color: #cccccc;
+                    vertical-alignment: center;
+                    col: 0;
+                }
+                
+                ComboBox {
+                    model: root.audio-devices;
+                    current-index: root.selected-device;
+                    current-value: root.audio-devices[root.selected-device];
+                    selected(value) => { root.device-changed(value); }
+                    col: 1;
+                    colspan: 2;
+                }
+            }
+            
+            Row {
+                Text {
+                    text: "Volume:";
+                    color: #cccccc;
+                    vertical-alignment: center;
+                    col: 0;
+                }
+                
+                Slider {
+                    value: root.volume;
+                    minimum: 0.0;
+                    maximum: 1.0;
+                    changed(value) => { root.volume-changed(value); }
+                    col: 1;
+                }
+                
+                Text {
+                    text: Math.round(root.volume * 100) + "%";
+                    color: #cccccc;
+                    horizontal-alignment: right;
+                    width: 40px;
+                    col: 2;
+                }
+            }
+        }
+        
+        Rectangle { }
+    }
+    
+    function format-time(seconds: float) -> string {
+        if (seconds < 0) { return "0:00"; }
+        return Math.floor(seconds / 60) + ":" + 
+               (Math.floor(Math.mod(seconds, 60)) < 10 ? "0" : "") + 
+               Math.floor(Math.mod(seconds, 60));
+    }
+}

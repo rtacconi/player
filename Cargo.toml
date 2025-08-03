@@ -1,0 +1,51 @@
+[package]
+name = "audiophile-player"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# GUI
+slint = "1.12"
+
+# Audio
+coreaudio-rs = "0.11"
+coreaudio-sys = "0.2"
+
+# Audio file decoding
+symphonia = { version = "0.5", features = ["all"] }
+
+# Async runtime for file I/O
+tokio = { version = "1.35", features = ["full"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Ring buffer for audio streaming
+ringbuf = "0.3"
+
+# Utilities
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+log = "0.4"
+env_logger = "0.10"
+
+# File dialog
+rfd = "0.12"
+
+# macOS specific
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.9"
+objc = "0.2"
+
+[build-dependencies]
+slint-build = "1.12"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 2
