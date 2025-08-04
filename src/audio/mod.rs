@@ -1,6 +1,5 @@
-// audio/mod.rs
 use anyhow::{Result, anyhow};
-use coreaudio::audio_unit::{AudioUnit, IOType, Scope, Element, render_callback::data::Interleaved};
+use coreaudio::audio_unit::{AudioUnit, IOType, Scope, Element};
 use coreaudio_sys::{
     AudioDeviceID, AudioObjectPropertyAddress,
     AudioObjectID, AudioObjectGetPropertyData,
@@ -11,63 +10,87 @@ use coreaudio_sys::{
     kAudioObjectPropertyElementMaster,
     kAudioUnitProperty_StreamFormat,
     AudioStreamBasicDescription,
+    kAudioDevicePropertyStreamConfiguration,
+    kAudioObjectPropertyScopeOutput,
 };
-use std::sync::{Arc, Mutex, RwLock};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use ringbuf::{HeapRb, HeapProducer, HeapConsumer};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU32, Ordering};
 use std::ffi::CStr;
 use std::os::raw::c_void;
 use std::ptr;
+use std::thread;
+use std::time::Duration;
+use crossbeam_channel::{bounded, Sender, Receiver};
+use rtrb::{RingBuffer, Producer, Consumer};
 
 use crate::decoder::FileDecoder;
+
+const RING_BUFFER_SIZE: usize = 2_097_152; // 2MB buffer (~12 seconds at 44.1kHz stereo)
 
 pub struct DeviceInfo {
     pub id: AudioDeviceID,
     pub name: String,
-    pub _sample_rates: Vec<u32>,
-    pub _max_channels: u32,
+}
+
+enum DecoderCommand {
+    Play,
+    Pause,
+    Stop,
+    Reload(String, f64), // path and position to reload at
 }
 
 pub struct AudioEngine {
     audio_unit: Option<AudioUnit>,
     current_device: AudioDeviceID,
-    sample_rate: u32,
-    channels: u32,
-    bit_depth: u32,
-    buffer_size: u32,
+    
+    // Audio format
+    sample_rate: Arc<AtomicU32>,
+    channels: Arc<AtomicU32>,
+    bit_depth: Arc<AtomicU32>,
+    duration: Arc<Mutex<f64>>,
     
     // Playback state
-    is_playing: AtomicBool,
-    position: Arc<AtomicU64>,
-    volume: Arc<RwLock<f32>>,
+    is_playing: Arc<AtomicBool>,
+    position_frames: Arc<AtomicU64>,
+    decoded_frames: Arc<AtomicU64>,  // Total frames decoded by decoder
+    volume: Arc<Mutex<f32>>,
+    current_file_path: Arc<Mutex<Option<String>>>,
+    is_eof: Arc<AtomicBool>,
     
-    // Audio pipeline
-    decoder: Arc<Mutex<Option<FileDecoder>>>,
-    ring_buffer_producer: Arc<Mutex<HeapProducer<f32>>>,
-    ring_buffer_consumer: Arc<Mutex<HeapConsumer<f32>>>,
+    // Ring buffer for audio data
+    ring_producer: Arc<Mutex<Option<Producer<f32>>>>,
+    ring_consumer: Arc<Mutex<Option<Consumer<f32>>>>,
     
-    // Exclusive mode
-    exclusive_mode: bool,
+    // Decoder thread control
+    decoder_command_tx: Option<Sender<DecoderCommand>>,
+    decoder_thread: Option<thread::JoinHandle<()>>,
+    
+    // Stats
+    underrun_count: Arc<AtomicU64>,
+    buffer_level: Arc<AtomicU64>,
 }
 
 impl AudioEngine {
     pub fn new() -> Result<Self> {
-        let (producer, consumer) = HeapRb::<f32>::new(480000).split(); // Increased buffer size
-        
         Ok(Self {
             audio_unit: None,
             current_device: get_default_device()?,
-            sample_rate: 44100,
-            channels: 2,
-            bit_depth: 24,
-            buffer_size: 512,
-            is_playing: AtomicBool::new(false),
-            position: Arc::new(AtomicU64::new(0)),
-            volume: Arc::new(RwLock::new(0.8)),
-            decoder: Arc::new(Mutex::new(None)),
-            ring_buffer_producer: Arc::new(Mutex::new(producer)),
-            ring_buffer_consumer: Arc::new(Mutex::new(consumer)),
-            exclusive_mode: false,
+            sample_rate: Arc::new(AtomicU32::new(44100)),
+            channels: Arc::new(AtomicU32::new(2)),
+            bit_depth: Arc::new(AtomicU32::new(16)),
+            duration: Arc::new(Mutex::new(0.0)),
+            is_playing: Arc::new(AtomicBool::new(false)),
+            position_frames: Arc::new(AtomicU64::new(0)),
+            decoded_frames: Arc::new(AtomicU64::new(0)),
+            volume: Arc::new(Mutex::new(0.8)),
+            current_file_path: Arc::new(Mutex::new(None)),
+            is_eof: Arc::new(AtomicBool::new(false)),
+            ring_producer: Arc::new(Mutex::new(None)),
+            ring_consumer: Arc::new(Mutex::new(None)),
+            decoder_command_tx: None,
+            decoder_thread: None,
+            underrun_count: Arc::new(AtomicU64::new(0)),
+            buffer_level: Arc::new(AtomicU64::new(0)),
         })
     }
     
@@ -110,8 +133,10 @@ impl AudioEngine {
             
             let mut device_infos = Vec::new();
             for device_id in devices {
-                if let Ok(info) = self.get_device_info(device_id) {
-                    device_infos.push(info);
+                if self.is_output_device(device_id)? {
+                    if let Ok(info) = self.get_device_info(device_id) {
+                        device_infos.push(info);
+                    }
                 }
             }
             
@@ -119,9 +144,29 @@ impl AudioEngine {
         }
     }
     
+    fn is_output_device(&self, device_id: AudioDeviceID) -> Result<bool> {
+        unsafe {
+            let property = AudioObjectPropertyAddress {
+                mSelector: kAudioDevicePropertyStreamConfiguration,
+                mScope: kAudioObjectPropertyScopeOutput,
+                mElement: kAudioObjectPropertyElementMaster,
+            };
+
+            let mut size = 0u32;
+            let status = AudioObjectGetPropertyDataSize(
+                device_id,
+                &property,
+                0,
+                ptr::null(),
+                &mut size,
+            );
+
+            Ok(status == 0 && size > 0)
+        }
+    }
+    
     fn get_device_info(&self, device_id: AudioDeviceID) -> Result<DeviceInfo> {
         unsafe {
-            // Get device name
             let property = AudioObjectPropertyAddress {
                 mSelector: kAudioDevicePropertyDeviceName,
                 mScope: kAudioObjectPropertyScopeGlobal,
@@ -148,12 +193,7 @@ impl AudioEngine {
                 .to_string_lossy()
                 .into_owned();
             
-            Ok(DeviceInfo {
-                id: device_id,
-                name,
-                _sample_rates: vec![44100, 48000, 88200, 96000, 176400, 192000],
-                _max_channels: 2,
-            })
+            Ok(DeviceInfo { id: device_id, name })
         }
     }
     
@@ -168,94 +208,185 @@ impl AudioEngine {
         Ok(())
     }
     
-    pub fn load_decoder(&mut self, decoder: FileDecoder) -> Result<()> {
+    pub fn load_decoder(&mut self, decoder: FileDecoder, file_path: String) -> Result<()> {
         println!("Loading decoder...");
+        
+        // Stop any existing decoder thread
+        if let Some(tx) = self.decoder_command_tx.take() {
+            tx.send(DecoderCommand::Stop).ok();
+        }
+        if let Some(handle) = self.decoder_thread.take() {
+            handle.join().ok();
+        }
+        
+        // Stop any existing playback
+        self.stop();
+        
+        // Get audio info
         let info = decoder.get_info();
-        println!("Audio info: {} Hz, {} channels, {} bit", info.sample_rate, info.channels, info.bit_depth);
-        self.sample_rate = info.sample_rate;
-        self.channels = info.channels;
-        self.bit_depth = info.bit_depth;
+        println!("Audio info: {} Hz, {} channels, {} bit, {:.1}s duration", 
+            info.sample_rate, info.channels, info.bit_depth, info.duration);
         
-        *self.decoder.lock().unwrap() = Some(decoder);
-        println!("Decoder stored successfully");
-        self.position.store(0, Ordering::Relaxed);
+        self.sample_rate.store(info.sample_rate, Ordering::Relaxed);
+        self.channels.store(info.channels, Ordering::Relaxed);
+        self.bit_depth.store(info.bit_depth, Ordering::Relaxed);
+        *self.duration.lock().unwrap() = info.duration;
+        *self.current_file_path.lock().unwrap() = Some(file_path);
+        self.position_frames.store(0, Ordering::Relaxed);
+        self.decoded_frames.store(0, Ordering::Relaxed);
+        self.underrun_count.store(0, Ordering::Relaxed);
+        self.is_eof.store(false, Ordering::Relaxed);
         
-        // Clear ring buffer
-        let mut rb = self.ring_buffer_consumer.lock().unwrap();
-        while rb.pop().is_some() {}
-        println!("Ring buffer cleared");
+        // Create new ring buffer
+        let (producer, consumer) = RingBuffer::new(RING_BUFFER_SIZE);
+        *self.ring_producer.lock().unwrap() = Some(producer);
+        *self.ring_consumer.lock().unwrap() = Some(consumer);
+        
+        // Create command channel
+        let (tx, rx) = bounded::<DecoderCommand>(10);
+        self.decoder_command_tx = Some(tx);
+        
+        // Start decoder thread
+        self.start_decoder_thread(decoder, rx)?;
         
         Ok(())
     }
     
-    fn setup_audio_unit(&mut self) -> Result<()> {
-        println!("Creating audio unit...");
-        let mut audio_unit = AudioUnit::new(IOType::DefaultOutput)?;
-        println!("Audio unit created successfully");
+    fn start_decoder_thread(&mut self, decoder: FileDecoder, command_rx: Receiver<DecoderCommand>) -> Result<()> {
+        let producer = self.ring_producer.clone();
+        let buffer_level = self.buffer_level.clone();
+        let channels = self.channels.load(Ordering::Relaxed);
+        let is_eof = self.is_eof.clone();
+        let decoded_frames = self.decoded_frames.clone();
         
-        // Configure format
+        let handle = thread::spawn(move || {
+            decoder_thread_main(decoder, producer, command_rx, buffer_level, channels, is_eof, decoded_frames);
+        });
+        
+        self.decoder_thread = Some(handle);
+        Ok(())
+    }
+    
+    fn setup_audio_unit(&mut self) -> Result<()> {
+        println!("Setting up audio unit...");
+        let mut audio_unit = AudioUnit::new(IOType::DefaultOutput)?;
+        
+        let sample_rate = self.sample_rate.load(Ordering::Relaxed);
+        let channels = self.channels.load(Ordering::Relaxed);
+        
+        // Configure format - INTERLEAVED
         let format = AudioStreamBasicDescription {
-            mSampleRate: self.sample_rate as f64,
+            mSampleRate: sample_rate as f64,
             mFormatID: 1819304813, // kAudioFormatLinearPCM
-            mFormatFlags: 0x00000001 | 0x00000008, // kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked
-            mBytesPerPacket: (self.channels * 4) as u32, // 4 bytes per f32 sample
+            mFormatFlags: 0x00000001 | 0x00000008, // Float32, Packed
+            mBytesPerPacket: (channels * 4) as u32,
             mFramesPerPacket: 1,
-            mBytesPerFrame: (self.channels * 4) as u32,
-            mChannelsPerFrame: self.channels,
+            mBytesPerFrame: (channels * 4) as u32,
+            mChannelsPerFrame: channels,
             mBitsPerChannel: 32,
             mReserved: 0,
         };
         
-        println!("Setting stream format: {} Hz, {} channels", self.sample_rate, self.channels);
-        match audio_unit.set_property(
+        audio_unit.set_property(
             kAudioUnitProperty_StreamFormat,
             Scope::Input,
             Element::Output,
             Some(&format),
-        ) {
-            Ok(_) => println!("Stream format set successfully"),
-            Err(e) => {
-                println!("Failed to set stream format: {:?}", e);
-                return Err(e.into());
-            }
-        }
+        )?;
         
         // Set up render callback
-        let consumer = self.ring_buffer_consumer.clone();
+        let consumer = self.ring_consumer.clone();
         let volume = self.volume.clone();
-        let position = self.position.clone();
+        let position = self.position_frames.clone();
+        let underrun_count = self.underrun_count.clone();
+        let buffer_level_ref = self.buffer_level.clone();
+        let channels_usize = channels as usize;
+        let is_eof_ref = self.is_eof.clone();
         
-        audio_unit.set_render_callback(move |args: coreaudio::audio_unit::render_callback::Args<Interleaved<f32>>| {
-            let mut rb = consumer.lock().unwrap();
-            let vol = *volume.read().unwrap();
+        audio_unit.set_render_callback(move |args| {
+            use coreaudio::audio_unit::render_callback::{Args, data::Interleaved};
+            let Args::<Interleaved<f32>> { num_frames, data, .. } = args;
 
-            let buffer = args.data.buffer; // &mut [f32]
-            let mut samples_available = 0;
+            let frames = num_frames as usize;
+            let samples_needed = frames * channels_usize;
+            let buffer = data.buffer;
             
-            for sample in buffer.iter_mut() {
-                if let Some(s) = rb.pop() {
-                    *sample = s * vol;
-                    samples_available += 1;
+            // Try to read from ring buffer
+            let mut did_read_data = false;
+            let mut available = 0;
+            if let Some(ref mut consumer) = *consumer.lock().unwrap() {
+                available = consumer.slots();
+                buffer_level_ref.store(available as u64, Ordering::Relaxed);
+                
+                if available >= samples_needed {
+                    did_read_data = true;
+                    // Read directly into output buffer
+                    match consumer.read_chunk(samples_needed) {
+                        Ok(chunk) => {
+                            let vol = *volume.lock().unwrap();
+                            let read_count = chunk.len().min(samples_needed);
+                            
+                            // Copy from chunk to buffer with volume
+                            let slice = chunk.as_slices();
+                            let mut idx = 0;
+                            
+                            // Handle first slice
+                            for &sample in slice.0 {
+                                if idx >= read_count {
+                                    break;
+                                }
+                                buffer[idx] = sample * vol;
+                                idx += 1;
+                            }
+                            
+                            // Handle second slice if wrapped
+                            for &sample in slice.1 {
+                                if idx >= read_count {
+                                    break;
+                                }
+                                buffer[idx] = sample * vol;
+                                idx += 1;
+                            }
+                            
+                            // Commit the read
+                            chunk.commit_all();
+                            
+                            // Fill remaining with silence if needed
+                            for i in read_count..samples_needed {
+                                buffer[i] = 0.0;
+                            }
+                        }
+                        Err(_) => {
+                            // No data available - fill with silence
+                            for i in 0..samples_needed {
+                                buffer[i] = 0.0;
+                            }
+                        }
+                    }
                 } else {
-                    *sample = 0.0;
-                }
-            }
-            
-            if samples_available == 0 {
-                // Only print warning occasionally to avoid spam
-                static mut WARNING_COUNT: u32 = 0;
-                unsafe {
-                    WARNING_COUNT += 1;
-                    if WARNING_COUNT % 100 == 0 { // Only print every 100th warning
-                        let count = WARNING_COUNT;
-                        println!("Warning: No samples available in render callback (count: {})", count);
+                    // Underrun - fill with silence
+                    // Only count underruns if we're not at EOF or if there's still data to play
+                    if !is_eof_ref.load(Ordering::Relaxed) {
+                underrun_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    for i in 0..samples_needed {
+                        buffer[i] = 0.0;
                     }
                 }
+            } else {
+                // No consumer - fill with silence
+                for i in 0..samples_needed {
+                    buffer[i] = 0.0;
+                }
             }
 
-            // Update position
-            position.fetch_add(args.num_frames as u64, Ordering::Relaxed);
-
+            // Only increment position if not at EOF and if we actually read data
+            if !is_eof_ref.load(Ordering::Relaxed) && did_read_data {
+                position.fetch_add(num_frames as u64, Ordering::Relaxed);
+            } else if is_eof_ref.load(Ordering::Relaxed) && available == 0 {
+                // We've reached EOF and consumed all buffered data
+                // This is the true end of playback
+            }
             Ok(())
         })?;
         
@@ -266,51 +397,24 @@ impl AudioEngine {
     }
     
     pub fn play(&mut self) -> Result<()> {
-        println!("Play method called");
+        println!("Play requested");
         
         if self.audio_unit.is_none() {
-            println!("Setting up audio unit...");
             self.setup_audio_unit()?;
-            println!("Audio unit setup complete");
         }
         
-        if let Some(audio_unit) = &mut self.audio_unit {
-            println!("Starting audio unit...");
-            audio_unit.start()?;
-            println!("Audio unit started successfully");
-            self.is_playing.store(true, Ordering::Relaxed);
-            
-            // Start decoder thread first
-            println!("Starting decoder thread...");
-            if let Some(_) = &*self.decoder.lock().unwrap() {
-                println!("Decoder is available, starting thread");
-                self.start_decoder_thread();
-                println!("Decoder thread started");
-                
-                // Wait for initial buffering before starting audio unit
-                println!("Buffering...");
-                let mut buffer_filled = false;
-                for _ in 0..50 { // Wait up to 500ms for buffering
-                    let rb = self.ring_buffer_consumer.lock().unwrap();
-                    let available = rb.len();
-                    if available > 8192 { // Wait for at least 8k samples 
-                        buffer_filled = true;
-                        println!("Buffer filled with {} samples", available);
-                        break;
-                    }
-                    drop(rb);
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                if !buffer_filled {
-                    println!("Warning: Buffer not filled, starting anyway");
-                }
-                println!("Playback started");
-            } else {
-                println!("ERROR: No decoder available!");
-            }
-        } else {
-            println!("No audio unit available!");
+        // Send play command to decoder
+        if let Some(tx) = &self.decoder_command_tx {
+            tx.send(DecoderCommand::Play).ok();
         }
+        
+        // Start audio unit
+            if let Some(audio_unit) = &mut self.audio_unit {
+                audio_unit.start()?;
+        }
+        
+        self.is_playing.store(true, Ordering::Relaxed);
+        println!("Playback started");
         
         Ok(())
     }
@@ -318,121 +422,267 @@ impl AudioEngine {
     pub fn pause(&mut self) {
         self.is_playing.store(false, Ordering::Relaxed);
         
+        if let Some(tx) = &self.decoder_command_tx {
+            tx.send(DecoderCommand::Pause).ok();
+        }
+        
         if let Some(audio_unit) = &mut self.audio_unit {
             audio_unit.stop().ok();
         }
     }
     
     pub fn stop(&mut self) {
-        self.pause();
-        self.position.store(0, Ordering::Relaxed);
+        self.is_playing.store(false, Ordering::Relaxed);
         
-        // Clear ring buffer
-        let mut rb = self.ring_buffer_consumer.lock().unwrap();
-        while rb.pop().is_some() {}
-    }
-    
-    fn start_decoder_thread(&self) {
-        let decoder = self.decoder.clone();
-        let ring_buffer_producer = self.ring_buffer_producer.clone();
-        let is_playing = Arc::new(AtomicBool::new(true));
-        let is_playing_clone = is_playing.clone();
+        if let Some(audio_unit) = &mut self.audio_unit {
+            audio_unit.stop().ok();
+        }
         
-        // Store the is_playing flag
-        self.is_playing.store(true, Ordering::Relaxed);
-        
-        std::thread::spawn(move || {
-            let mut temp_buffer = vec![0f32; 8192]; // Increased buffer size for stereo
-            let mut total_frames = 0;
-            
-            println!("Decoder thread started");
-            
-            while is_playing.load(Ordering::Relaxed) {
-                if let Some(ref mut dec) = *decoder.lock().unwrap() {
-                    match dec.decode_frames(&mut temp_buffer) {
-                        Ok(frames) => {
-                            if frames > 0 {
-                                // Add samples to ring buffer with better flow control
-                                let mut rb = ring_buffer_producer.lock().unwrap();
-                                // frames is already the total number of samples (frames * channels)
-                                if frames <= temp_buffer.len() {
-                                    // Check if we have space in the buffer
-                                    let free_space = rb.free_len();
-                                    let capacity = rb.capacity();
-                                    if free_space >= frames {
-                                        rb.push_slice(&temp_buffer[..frames]);
-                                        total_frames += frames / 2; // Convert back to audio frames
-                                        if total_frames % 5000 == 0 { // More frequent logging
-                                            println!("Decoded {} samples, total frames: {}, buffer: {}/{}", frames, total_frames, capacity - free_space, capacity);
-                                        }
-                                    } else {
-                                        // Buffer is full, wait a bit
-                                        println!("Buffer full (free: {}, need: {}), waiting...", free_space, frames);
-                                        drop(rb);
-                                        std::thread::sleep(std::time::Duration::from_millis(10));
-                                        continue;
-                                    }
-                                } else {
-                                    println!("Warning: Buffer overflow, samples: {}, buffer size: {}", frames, temp_buffer.len());
-                                    return;
-                                }
-                            } else {
-                                // End of file
-                                println!("End of file reached");
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            println!("Decoder error: {:?}", e);
-                            break;
-                        }
-                    }
-                } else {
-                    println!("No decoder available");
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-            }
-            
-            println!("Decoder thread ending, total frames decoded: {}", total_frames);
-            is_playing_clone.store(false, Ordering::Relaxed);
-        });
-    }
-    
-    pub fn get_position(&self) -> f64 {
-        let frames = self.position.load(Ordering::Relaxed);
-        frames as f64 / self.sample_rate as f64
+        // Just pause the decoder, don't reset position
+        if let Some(tx) = &self.decoder_command_tx {
+            tx.send(DecoderCommand::Pause).ok();
+        }
     }
     
     pub fn seek(&mut self, position_seconds: f64) {
-        if let Some(ref mut decoder) = *self.decoder.lock().unwrap() {
-            decoder.seek(position_seconds).ok();
-            let frames = (position_seconds * self.sample_rate as f64) as u64;
-            self.position.store(frames, Ordering::Relaxed);
-            
-            // Clear ring buffer
-            let mut rb = self.ring_buffer_consumer.lock().unwrap();
-            while rb.pop().is_some() {}
+        // Clamp position to valid range
+        let duration = self.get_duration();
+        let clamped_position = position_seconds.max(0.0).min(duration);
+        
+        println!("Seek: requested={:.1}s, clamped={:.1}s, duration={:.1}s", 
+                 position_seconds, clamped_position, duration);
+        
+        // Update position immediately for UI feedback
+        let frames = (clamped_position * self.sample_rate.load(Ordering::Relaxed) as f64) as u64;
+        self.position_frames.store(frames, Ordering::Relaxed);
+        
+        println!("Seek: set position to {} frames ({:.1}s)", frames, clamped_position);
+        
+        // Clear the ring buffer to prevent old audio from playing
+        if let Some(ref mut consumer) = *self.ring_consumer.lock().unwrap() {
+            while consumer.slots() > 0 {
+                if let Ok(chunk) = consumer.read_chunk(consumer.slots()) {
+                    chunk.commit_all();
+                } else {
+                    break;
+                }
+            }
+        }
+        
+        // Always use reload since Symphonia's BufReader only supports forward seeking
+        if let Some(tx) = &self.decoder_command_tx {
+            if let Some(file_path) = &*self.current_file_path.lock().unwrap() {
+                tx.send(DecoderCommand::Reload(file_path.clone(), clamped_position)).ok();
+            }
         }
     }
     
     pub fn set_volume(&mut self, volume: f32) {
-        *self.volume.write().unwrap() = volume.clamp(0.0, 1.0);
+        *self.volume.lock().unwrap() = volume.clamp(0.0, 1.0);
+    }
+    
+    pub fn get_position(&self) -> f64 {
+        let frames = self.position_frames.load(Ordering::Relaxed);
+        let decoded = self.decoded_frames.load(Ordering::Relaxed);
+        let sample_rate = self.sample_rate.load(Ordering::Relaxed);
+        
+        // If we're at EOF and all data has been consumed, return the final position
+        let is_eof = self.is_eof.load(Ordering::Relaxed);
+        let final_frames = if is_eof && frames >= decoded && decoded > 0 {
+            decoded
+        } else {
+            frames
+        };
+        
+        let position = final_frames as f64 / sample_rate as f64;
+        
+        // Log every 10th call to avoid spam
+        static mut LOG_COUNT: u32 = 0;
+        unsafe {
+            LOG_COUNT += 1;
+            if LOG_COUNT % 10 == 0 {
+                println!("Position: {} frames @ {}Hz = {:.1}s (decoded: {})", 
+                        final_frames, sample_rate, position, decoded);
+            }
+        }
+        
+        position
     }
     
     pub fn get_sample_rate(&self) -> u32 {
-        self.sample_rate
+        self.sample_rate.load(Ordering::Relaxed)
     }
     
     pub fn get_bit_depth(&self) -> u32 {
-        self.bit_depth
-    }
-    
-    pub fn get_buffer_size(&self) -> u32 {
-        self.buffer_size
+        self.bit_depth.load(Ordering::Relaxed)
     }
     
     pub fn is_exclusive_mode(&self) -> bool {
-        self.exclusive_mode
+        false
+    }
+    
+    pub fn get_buffer_stats(&self) -> (usize, usize, f32) {
+        let used = self.buffer_level.load(Ordering::Relaxed) as usize;
+        let capacity = RING_BUFFER_SIZE;
+        let percentage = (used as f32 / capacity as f32) * 100.0;
+        (used, capacity, percentage)
+    }
+    
+    pub fn get_underrun_count(&self) -> u64 {
+        self.underrun_count.load(Ordering::Relaxed)
+    }
+    
+    pub fn get_duration(&self) -> f64 {
+        *self.duration.lock().unwrap()
+    }
+}
+
+fn decoder_thread_main(
+    mut decoder: FileDecoder,
+    producer: Arc<Mutex<Option<Producer<f32>>>>,
+    command_rx: Receiver<DecoderCommand>,
+    buffer_level: Arc<AtomicU64>,
+    channels: u32,
+    is_eof: Arc<AtomicBool>,
+    decoded_frames: Arc<AtomicU64>,
+) {
+    println!("Decoder thread started");
+    
+    let mut temp_buffer = vec![0f32; 65536]; // 64K samples
+    let mut is_paused = true;
+    let mut total_frames = 0u64;
+    let mut eof_reached = false;
+    
+    loop {
+        // Check for commands (non-blocking)
+        match command_rx.try_recv() {
+            Ok(DecoderCommand::Play) => {
+                println!("Decoder: Play command received");
+                is_paused = false;
+            }
+            Ok(DecoderCommand::Pause) => {
+                println!("Decoder: Pause command received");
+                is_paused = true;
+            }
+            Ok(DecoderCommand::Stop) => {
+                println!("Decoder: Stop command received");
+                break;
+            }
+            Ok(DecoderCommand::Reload(file_path, position)) => {
+                println!("Decoder: Reload file at {:.1}s", position);
+                // Create a new decoder from the file
+                match FileDecoder::open(std::path::Path::new(&file_path)) {
+                    Ok(new_decoder) => {
+                        decoder = new_decoder;
+                        eof_reached = false;
+                        is_eof.store(false, Ordering::Relaxed);
+                        
+                        // If position is 0, don't seek (start from beginning)
+                        if position > 0.0 {
+                            // Seek to the desired position
+                            match decoder.seek(position) {
+                                Ok(_) => {
+                                    println!("Decoder: Reload and seek to {:.1}s successful", position);
+                                }
+                                Err(e) => {
+                                    println!("Decoder: Seek after reload failed: {:?}", e);
+                                    // If seek fails, we'll start from the beginning
+                                }
+                            }
+                        } else {
+                            println!("Decoder: Reloaded at beginning");
+                        }
+                        
+                        // Update total frames based on position
+                        let sample_rate = decoder.get_info().sample_rate as f64;
+                        total_frames = (position * sample_rate) as u64;
+                        decoded_frames.store(total_frames, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        println!("Decoder: Failed to reload file: {:?}", e);
+                    }
+                }
+            }
+            Err(_) => {} // No command
+        }
+        
+        if is_paused || eof_reached {
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        
+        // Check buffer space
+        if let Some(ref mut producer) = *producer.lock().unwrap() {
+            let free_slots = producer.slots();
+            buffer_level.store((RING_BUFFER_SIZE - free_slots) as u64, Ordering::Relaxed);
+            
+            // If buffer is nearly full, wait
+            if free_slots < temp_buffer.len() / 2 {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            
+            // Decode audio
+            match decoder.decode_frames(&mut temp_buffer) {
+                Ok(samples) => {
+                    if samples == 0 {
+                        println!("Decoder: EOF reached after {} frames", total_frames);
+                        decoded_frames.store(total_frames, Ordering::Relaxed);
+                        eof_reached = true;
+                        is_eof.store(true, Ordering::Relaxed);
+                        continue;
+                    }
+                    
+                    // Write to ring buffer
+                    match producer.write_chunk(samples) {
+                        Ok(mut chunk) => {
+                            // Get mutable slices from the chunk
+                            let (first, second) = chunk.as_mut_slices();
+                            let mut written = 0;
+                            
+                            // Copy to first slice
+                            let first_len = first.len().min(samples);
+                            first[..first_len].copy_from_slice(&temp_buffer[..first_len]);
+                            written += first_len;
+                            
+                            // Copy to second slice if needed (ring buffer wrapped)
+                            if written < samples && !second.is_empty() {
+                                let second_len = (samples - written).min(second.len());
+                                second[..second_len].copy_from_slice(&temp_buffer[written..written + second_len]);
+                            }
+                            
+                            chunk.commit_all();
+                            
+                            total_frames += (samples / channels as usize) as u64;
+                            decoded_frames.store(total_frames, Ordering::Relaxed);
+                            
+                            if total_frames % (44100 * 10) == 0 {
+                                println!("Decoded {} frames ({:.1}s)", total_frames, total_frames as f64 / 44100.0);
+                            }
+                        }
+                        Err(_) => {
+                            // Buffer full, wait a bit
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("Decoder error: {:?}", e);
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        } else {
+            break; // No producer available
+        }
+    }
+    
+    decoded_frames.store(total_frames, Ordering::Relaxed);
+    println!("Decoder thread ended. Total frames: {}", total_frames);
+}
+
+impl Drop for AudioEngine {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -464,7 +714,4 @@ fn get_default_device() -> Result<AudioDeviceID> {
     }
 }
 
-// Core Audio constants
 const K_AUDIO_OBJECT_SYSTEM_OBJECT: AudioObjectID = 1;
-
-

@@ -34,7 +34,7 @@ fn main() -> Result<()> {
                     .add_filter("Audio Files", &["flac", "wav", "aiff", "aif", "m4a", "mp3"])
                     .pick_file()
                 {
-                    let _path_str = path.to_string_lossy().to_string();
+                    let path_str = path.to_string_lossy().to_string();
                     
                     match FileDecoder::open(&path) {
                         Ok(decoder) => {
@@ -50,9 +50,10 @@ fn main() -> Result<()> {
                             )));
                             app.set_duration(info.duration as f32);
                             app.set_position(0.0);
+                            app.set_is_playing(false); // Reset play button to show play icon
                             
                             let mut engine = audio_engine.lock().unwrap();
-                            engine.load_decoder(decoder).ok();
+                            engine.load_decoder(decoder, path_str).ok();
                         }
                         Err(e) => {
                             app.set_current_file(SharedString::from("Error loading file"));
@@ -136,16 +137,17 @@ fn main() -> Result<()> {
         }
     });
     
-    // Update timer for position
+    // Update timer for position and playback info
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(100), {
         let app_weak = app_weak.clone();
         let audio_engine = audio_engine_clone;
         move || {
             if let Some(app) = app_weak.upgrade() {
+                let engine = audio_engine.lock().unwrap();
+                app.set_position(engine.get_position() as f32);
                 if app.get_is_playing() {
-                    let engine = audio_engine.lock().unwrap();
-                    app.set_position(engine.get_position() as f32);
+                    update_playback_info(&app, &engine);
                 }
             }
         }
@@ -171,11 +173,17 @@ fn update_device_list(app: &PlayerWindow, audio_engine: &Arc<Mutex<AudioEngine>>
 }
 
 fn update_playback_info(app: &PlayerWindow, engine: &AudioEngine) {
+    let (buffer_used, buffer_capacity, buffer_percentage) = engine.get_buffer_stats();
+    let underrun_count = engine.get_underrun_count();
+    
     let info = format!(
-        "{}Hz {}bit | Buffer: {}ms | {}",
+        "{}Hz {}bit | Buffer: {:.1}% ({}/{}) | Underruns: {} | {}",
         engine.get_sample_rate(),
         engine.get_bit_depth(),
-        engine.get_buffer_size() * 1000 / engine.get_sample_rate(),
+        buffer_percentage,
+        buffer_used,
+        buffer_capacity,
+        underrun_count,
         if engine.is_exclusive_mode() { "Exclusive" } else { "Shared" }
     );
     app.set_playback_info(SharedString::from(info));

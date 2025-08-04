@@ -14,19 +14,17 @@ coreaudio-sys = "0.2"
 # Audio file decoding
 symphonia = { version = "0.5", features = ["all"] }
 
-# Async runtime for file I/O
-tokio = { version = "1.35", features = ["full"] }
+# Lock-free ring buffer
+rtrb = "0.2"
+
+# Channel for thread communication
+crossbeam-channel = "0.5"
 
 # Error handling
 anyhow = "1.0"
 thiserror = "1.0"
 
-# Ring buffer for audio streaming
-ringbuf = "0.3"
-
 # Utilities
-crossbeam-channel = "0.5"
-parking_lot = "0.12"
 log = "0.4"
 env_logger = "0.10"
 
