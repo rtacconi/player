@@ -135,7 +135,13 @@ impl AudioEngine {
             for device_id in devices {
                 if self.is_output_device(device_id)? {
                     if let Ok(info) = self.get_device_info(device_id) {
-                        device_infos.push(info);
+                        // Filter out microphone and input devices
+                        let name_lower = info.name.to_lowercase();
+                        if !name_lower.contains("microphone") && 
+                           !name_lower.contains("input") && 
+                           !name_lower.contains("mic") {
+                            device_infos.push(info);
+                        }
                     }
                 }
             }
@@ -302,7 +308,7 @@ impl AudioEngine {
         let buffer_level_ref = self.buffer_level.clone();
         let channels_usize = channels as usize;
         let is_eof_ref = self.is_eof.clone();
-        
+
         audio_unit.set_render_callback(move |args| {
             use coreaudio::audio_unit::render_callback::{Args, data::Interleaved};
             let Args::<Interleaved<f32>> { num_frames, data, .. } = args;
@@ -310,83 +316,60 @@ impl AudioEngine {
             let frames = num_frames as usize;
             let samples_needed = frames * channels_usize;
             let buffer = data.buffer;
-            
-            // Try to read from ring buffer
-            let mut did_read_data = false;
-            let mut available = 0;
+
+            let is_eof = is_eof_ref.load(Ordering::Relaxed);
+
+            // Read whatever is available (up to samples_needed), aligned to whole frames.
+            // Fill any remainder with silence. This keeps position tracking accurate even
+            // when the decoder has finished and the ring buffer is draining its tail.
+            let mut frames_read = 0usize;
             if let Some(ref mut consumer) = *consumer.lock().unwrap() {
-                available = consumer.slots();
+                let available = consumer.slots();
                 buffer_level_ref.store(available as u64, Ordering::Relaxed);
-                
-                if available >= samples_needed {
-                    did_read_data = true;
-                    // Read directly into output buffer
-                    match consumer.read_chunk(samples_needed) {
-                        Ok(chunk) => {
-                            let vol = *volume.lock().unwrap();
-                            let read_count = chunk.len().min(samples_needed);
-                            
-                            // Copy from chunk to buffer with volume
-                            let slice = chunk.as_slices();
-                            let mut idx = 0;
-                            
-                            // Handle first slice
-                            for &sample in slice.0 {
-                                if idx >= read_count {
-                                    break;
-                                }
-                                buffer[idx] = sample * vol;
-                                idx += 1;
-                            }
-                            
-                            // Handle second slice if wrapped
-                            for &sample in slice.1 {
-                                if idx >= read_count {
-                                    break;
-                                }
-                                buffer[idx] = sample * vol;
-                                idx += 1;
-                            }
-                            
-                            // Commit the read
-                            chunk.commit_all();
-                            
-                            // Fill remaining with silence if needed
-                            for i in read_count..samples_needed {
-                                buffer[i] = 0.0;
-                            }
+
+                let frames_available = available / channels_usize;
+                let frames_to_read = frames_available.min(frames);
+                let samples_to_read = frames_to_read * channels_usize;
+
+                if samples_to_read > 0 {
+                    if let Ok(chunk) = consumer.read_chunk(samples_to_read) {
+                        let vol = *volume.lock().unwrap();
+                        let (first, second) = chunk.as_slices();
+                        let mut idx = 0;
+                        for &sample in first {
+                            if idx >= samples_to_read { break; }
+                            buffer[idx] = sample * vol;
+                            idx += 1;
                         }
-                        Err(_) => {
-                            // No data available - fill with silence
-                            for i in 0..samples_needed {
-                                buffer[i] = 0.0;
-                            }
+                        for &sample in second {
+                            if idx >= samples_to_read { break; }
+                            buffer[idx] = sample * vol;
+                            idx += 1;
                         }
-                    }
-                } else {
-                    // Underrun - fill with silence
-                    // Only count underruns if we're not at EOF or if there's still data to play
-                    if !is_eof_ref.load(Ordering::Relaxed) {
-                underrun_count.fetch_add(1, Ordering::Relaxed);
-                    }
-                    for i in 0..samples_needed {
-                        buffer[i] = 0.0;
+                        chunk.commit_all();
+                        frames_read = frames_to_read;
                     }
                 }
+
+                // Silence-fill any remaining samples in the output buffer
+                for i in (frames_read * channels_usize)..samples_needed {
+                    buffer[i] = 0.0;
+                }
+
+                // Count underruns only mid-song (not while draining at EOF)
+                if frames_read < frames && !is_eof {
+                    underrun_count.fetch_add(1, Ordering::Relaxed);
+                }
             } else {
-                // No consumer - fill with silence
                 for i in 0..samples_needed {
                     buffer[i] = 0.0;
                 }
             }
 
-            // Only increment position if not at EOF and if we actually read data
-            if !is_eof_ref.load(Ordering::Relaxed) && did_read_data {
-                position.fetch_add(num_frames as u64, Ordering::Relaxed);
-            } else if is_eof_ref.load(Ordering::Relaxed) && available == 0 {
-                // We've reached EOF and consumed all buffered data
-                // This is the true end of playback
+            if frames_read > 0 {
+                position.fetch_add(frames_read as u64, Ordering::Relaxed);
             }
+
             Ok(())
         })?;
         
@@ -449,14 +432,9 @@ impl AudioEngine {
         let duration = self.get_duration();
         let clamped_position = position_seconds.max(0.0).min(duration);
         
-        println!("Seek: requested={:.1}s, clamped={:.1}s, duration={:.1}s", 
-                 position_seconds, clamped_position, duration);
-        
         // Update position immediately for UI feedback
         let frames = (clamped_position * self.sample_rate.load(Ordering::Relaxed) as f64) as u64;
         self.position_frames.store(frames, Ordering::Relaxed);
-        
-        println!("Seek: set position to {} frames ({:.1}s)", frames, clamped_position);
         
         // Clear the ring buffer to prevent old audio from playing
         if let Some(ref mut consumer) = *self.ring_consumer.lock().unwrap() {
@@ -472,7 +450,10 @@ impl AudioEngine {
         // Always use reload since Symphonia's BufReader only supports forward seeking
         if let Some(tx) = &self.decoder_command_tx {
             if let Some(file_path) = &*self.current_file_path.lock().unwrap() {
-                tx.send(DecoderCommand::Reload(file_path.clone(), clamped_position)).ok();
+                // Only send reload command if we have a valid file path
+                if !file_path.is_empty() {
+                    tx.send(DecoderCommand::Reload(file_path.clone(), clamped_position)).ok();
+                }
             }
         }
     }
@@ -481,32 +462,32 @@ impl AudioEngine {
         *self.volume.lock().unwrap() = volume.clamp(0.0, 1.0);
     }
     
+    pub fn get_volume(&self) -> Arc<Mutex<f32>> {
+        self.volume.clone()
+    }
+    
     pub fn get_position(&self) -> f64 {
         let frames = self.position_frames.load(Ordering::Relaxed);
-        let decoded = self.decoded_frames.load(Ordering::Relaxed);
-        let sample_rate = self.sample_rate.load(Ordering::Relaxed);
-        
-        // If we're at EOF and all data has been consumed, return the final position
+        let sample_rate = self.sample_rate.load(Ordering::Relaxed).max(1);
+        let duration = self.get_duration();
         let is_eof = self.is_eof.load(Ordering::Relaxed);
-        let final_frames = if is_eof && frames >= decoded && decoded > 0 {
-            decoded
-        } else {
-            frames
-        };
-        
-        let position = final_frames as f64 / sample_rate as f64;
-        
-        // Log every 10th call to avoid spam
-        static mut LOG_COUNT: u32 = 0;
-        unsafe {
-            LOG_COUNT += 1;
-            if LOG_COUNT % 10 == 0 {
-                println!("Position: {} frames @ {}Hz = {:.1}s (decoded: {})", 
-                        final_frames, sample_rate, position, decoded);
-            }
+        let buffer_level = self.buffer_level.load(Ordering::Relaxed);
+
+        let position = frames as f64 / sample_rate as f64;
+
+        // When the decoder is done AND the ring buffer is fully drained, the song has
+        // truly finished playing - snap the slider exactly to the end.
+        if is_eof && buffer_level == 0 && duration > 0.0 {
+            return duration;
         }
-        
-        position
+
+        // Otherwise track real playback position, capped at duration so the slider
+        // can't visually exceed its maximum.
+        if duration > 0.0 {
+            position.min(duration)
+        } else {
+            position
+        }
     }
     
     pub fn get_sample_rate(&self) -> u32 {
@@ -534,6 +515,18 @@ impl AudioEngine {
     
     pub fn get_duration(&self) -> f64 {
         *self.duration.lock().unwrap()
+    }
+    
+    pub fn should_stop_playback(&self) -> bool {
+        let is_eof = self.is_eof.load(Ordering::Relaxed);
+        let buffer_level = self.buffer_level.load(Ordering::Relaxed);
+        let position = self.position_frames.load(Ordering::Relaxed);
+        let decoded = self.decoded_frames.load(Ordering::Relaxed);
+        
+        // Stop if we're at EOF and either:
+        // 1. Buffer is empty, or
+        // 2. We've reached the decoded position
+        is_eof && (buffer_level == 0 || position >= decoded)
     }
 }
 
@@ -577,20 +570,16 @@ fn decoder_thread_main(
                         eof_reached = false;
                         is_eof.store(false, Ordering::Relaxed);
                         
-                        // If position is 0, don't seek (start from beginning)
-                        if position > 0.0 {
-                            // Seek to the desired position
-                            match decoder.seek(position) {
-                                Ok(_) => {
-                                    println!("Decoder: Reload and seek to {:.1}s successful", position);
-                                }
-                                Err(e) => {
-                                    println!("Decoder: Seek after reload failed: {:?}", e);
-                                    // If seek fails, we'll start from the beginning
-                                }
+                        // Always seek to the desired position, even if it's 0
+                        // This ensures we start from the exact position requested
+                        match decoder.seek(position) {
+                            Ok(_) => {
+                                println!("Decoder: Reload and seek to {:.1}s successful", position);
                             }
-                        } else {
-                            println!("Decoder: Reloaded at beginning");
+                            Err(e) => {
+                                println!("Decoder: Seek after reload failed: {:?}", e);
+                                // If seek fails, we'll start from the beginning
+                            }
                         }
                         
                         // Update total frames based on position
@@ -655,10 +644,6 @@ fn decoder_thread_main(
                             
                             total_frames += (samples / channels as usize) as u64;
                             decoded_frames.store(total_frames, Ordering::Relaxed);
-                            
-                            if total_frames % (44100 * 10) == 0 {
-                                println!("Decoded {} frames ({:.1}s)", total_frames, total_frames as f64 / 44100.0);
-                            }
                         }
                         Err(_) => {
                             // Buffer full, wait a bit

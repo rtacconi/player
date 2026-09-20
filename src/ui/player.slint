@@ -1,12 +1,195 @@
-import { Button, ComboBox, Slider, StandardButton, LineEdit, ScrollView, VerticalBox, HorizontalBox, GridBox } from "std-widgets.slint";
+import { Button, ComboBox, Slider, VerticalBox, HorizontalBox, GridBox, ListView, ScrollView } from "std-widgets.slint";
+
+export struct TrackInfo {
+    display-number: string,
+    title: string,
+    duration-text: string,
+}
+
+export struct AlbumTileData {
+    title: string,
+    artist: string,
+    cover: image,
+    album-index: int,
+}
+
+export struct AlbumRow {
+    c0: AlbumTileData,
+    c1: AlbumTileData,
+    c2: AlbumTileData,
+    c3: AlbumTileData,
+}
+
+component IconButton inherits Rectangle {
+    in property <image> icon;
+    in property <bool> enabled: true;
+    callback clicked();
+    width: 44px;
+    height: 44px;
+    border-radius: 6px;
+    opacity: root.enabled ? 1.0 : 0.35;
+    background: ta.pressed ? #3a3a3a : (ta.has-hover ? #2f2f2f : transparent);
+
+    Image {
+        source: root.icon;
+        width: 22px;
+        height: 22px;
+        colorize: #ffffff;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+    }
+
+    ta := TouchArea {
+        width: 100%;
+        height: 100%;
+        enabled: root.enabled;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+/// Progress derived only from `position` / `duration` so it stays correct when tracks change (avoids std Slider internal cache).
+/// Seek is committed only on pointer-up to avoid spamming the audio engine while scrubbing.
+component PlaybackProgress inherits Rectangle {
+    in property <float> position;
+    in property <float> duration;
+    callback seek(float);
+    height: 12px;
+    border-radius: 6px;
+    background: #3a3a3a;
+    clip: true;
+
+    private property <bool> scrubbing: false;
+    private property <float> scrub-position: 0;
+    private property <float> ratio: root.duration > 0.0001 ? Math.min(1, (root.scrubbing ? root.scrub-position : root.position) / root.duration) : 0;
+
+    Rectangle {
+        width: parent.width * ratio;
+        height: parent.height;
+        background: #0a84ff;
+        border-radius: parent.border-radius;
+    }
+
+    ta := TouchArea {
+        width: 100%;
+        height: 100%;
+        pointer-event(event) => {
+            if (event.button != PointerEventButton.left) {
+                return;
+            }
+            if (event.kind == PointerEventKind.down && root.duration > 0) {
+                root.scrubbing = true;
+                root.update-scrub(self.mouse-x);
+            }
+            if (event.kind == PointerEventKind.up && root.scrubbing) {
+                root.update-scrub(self.mouse-x);
+                root.scrubbing = false;
+                root.seek(root.scrub-position);
+            }
+        }
+        moved => {
+            if (root.scrubbing && root.duration > 0) {
+                root.update-scrub(self.mouse-x);
+            }
+        }
+    }
+
+    function update-scrub(mx: length) {
+        if (root.width <= 0px || root.duration <= 0) {
+            return;
+        }
+        root.scrub-position = Math.max(0, Math.min(1, mx / root.width)) * root.duration;
+    }
+}
+
+component NavItem inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected;
+    callback pressed();
+    height: 48px;
+    width: 100%;
+    background: touch.pressed ? #404040 : (root.selected ? #353535 : transparent);
+    border-radius: 6px;
+
+    Text {
+        text: root.label;
+        color: #eeeeee;
+        font-size: 14px;
+        font-weight: root.selected ? 700 : 500;
+        x: 16px;
+        y: (parent.height - self.height) / 2;
+    }
+
+    touch := TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => {
+            root.pressed();
+        }
+    }
+}
+
+component AlbumTile inherits Rectangle {
+    in property <AlbumTileData> data;
+    callback picked(int);
+    width: 148px;
+    height: 188px;
+    background: #2a2a2a;
+    border-radius: 8px;
+    clip: true;
+
+    VerticalBox {
+        padding: 8px;
+        spacing: 6px;
+
+        Rectangle {
+            height: 120px;
+            width: 100%;
+            background: #1e1e1e;
+            border-radius: 6px;
+            clip: true;
+
+            Image {
+                source: root.data.cover;
+                width: 100%;
+                height: 100%;
+                image-fit: cover;
+            }
+        }
+
+        Text {
+            text: root.data.title;
+            color: #ffffff;
+            font-size: 12px;
+            font-weight: 600;
+            overflow: elide;
+        }
+
+        Text {
+            text: root.data.artist;
+            color: #aaaaaa;
+            font-size: 11px;
+            overflow: elide;
+        }
+    }
+
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        enabled: root.data.album-index >= 0;
+        clicked => {
+            root.picked(root.data.album-index);
+        }
+    }
+}
 
 export component PlayerWindow inherits Window {
     title: "Audiophile Player";
-    preferred-width: 600px;
-    preferred-height: 400px;
+    preferred-width: 960px;
+    preferred-height: 640px;
     background: #1a1a1a;
-    
-    // Callbacks
+
     callback play();
     callback pause();
     callback stop();
@@ -14,8 +197,12 @@ export component PlayerWindow inherits Window {
     callback seek(float);
     callback volume-changed(float);
     callback device-changed(string);
-    
-    // Properties
+    callback prev-track();
+    callback next-track();
+    callback play-track(int);
+    callback scan-music-library();
+    callback open-album(int);
+
     in-out property <bool> is-playing: false;
     in-out property <string> current-file: "No file loaded";
     in-out property <string> file-info: "";
@@ -25,161 +212,438 @@ export component PlayerWindow inherits Window {
     in-out property <[string]> audio-devices: ["Default"];
     in-out property <int> selected-device: 0;
     in-out property <string> playback-info: "Stopped";
-    
-    VerticalBox {
-        padding: 20px;
-        spacing: 15px;
-        
-        // File info section
+
+    in-out property <image> album-artwork;
+    in-out property <string> track-title: "";
+    in-out property <string> track-artist: "";
+    in-out property <string> track-album: "";
+    in-out property <string> track-album-artist: "";
+    in-out property <string> track-year: "";
+    in-out property <string> track-genre: "";
+    in-out property <string> track-composer: "";
+    in-out property <string> track-position-label: "";
+    in-out property <string> mb-status: "";
+    in-out property <[TrackInfo]> tracks: [];
+    in-out property <int> current-track-index: -1;
+
+    in-out property <int> active-view: 0;
+    in-out property <[AlbumRow]> album-rows: [];
+
+    HorizontalBox {
+        spacing: 0px;
+
+        // Left navigation
         Rectangle {
-            background: #2a2a2a;
-            border-radius: 8px;
-            height: 80px;
-            
+            width: 168px;
+            background: #252525;
+
             VerticalBox {
-                padding: 10px;
-                
+                padding: 12px;
+                spacing: 8px;
+                alignment: start;
+
                 Text {
-                    text: root.current-file;
-                    color: #ffffff;
-                    font-size: 14px;
-                    font-weight: 600;
-                    overflow: elide;
-                }
-                
-                Text {
-                    text: root.file-info;
+                    text: "Library";
                     color: #888888;
-                    font-size: 12px;
-                }
-                
-                Text {
-                    text: root.playback-info;
-                    color: #00ff00;
                     font-size: 11px;
-                    font-family: "monospace";
+                    font-weight: 600;
+                }
+
+                NavItem {
+                    label: "Player";
+                    selected: root.active-view == 0;
+                    pressed => {
+                        root.active-view = 0;
+                    }
+                }
+
+                NavItem {
+                    label: "Albums";
+                    selected: root.active-view == 1;
+                    pressed => {
+                        root.active-view = 1;
+                    }
+                }
+
+                Rectangle {
+                    vertical-stretch: 1;
                 }
             }
         }
-        
-        // Progress bar
+
         Rectangle {
-            height: 60px;
-            
-            VerticalBox {
-                Slider {
-                    value: root.position;
-                    maximum: root.duration;
-                    enabled: root.duration > 0;
-                    changed(value) => { root.seek(value); }
-                }
-                
+            horizontal-stretch: 1;
+            background: #1a1a1a;
+
+            if root.active-view == 0: VerticalBox {
+                padding: 16px;
+                spacing: 12px;
+
                 HorizontalBox {
+                    spacing: 16px;
+                    alignment: stretch;
+
+                    Rectangle {
+                        width: 200px;
+                        height: 200px;
+                        border-radius: 10px;
+                        background: #2a2a2a;
+                        clip: true;
+
+                        Image {
+                            source: root.album-artwork;
+                            width: 100%;
+                            height: 100%;
+                            image-fit: cover;
+                        }
+                    }
+
+                    VerticalBox {
+                        horizontal-stretch: 1;
+                        spacing: 4px;
+                        alignment: start;
+
+                        Text {
+                            text: root.track-title;
+                            color: #ffffff;
+                            font-size: 18px;
+                            font-weight: 700;
+                            overflow: elide;
+                        }
+
+                        Text {
+                            text: root.track-artist;
+                            color: #dddddd;
+                            font-size: 14px;
+                            overflow: elide;
+                        }
+
+                        Text {
+                            text: root.track-album;
+                            color: #bbbbbb;
+                            font-size: 13px;
+                            overflow: elide;
+                        }
+
+                        Text {
+                            text: root.track-album-artist;
+                            color: #999999;
+                            font-size: 12px;
+                            overflow: elide;
+                        }
+
+                        Text {
+                            text: root.track-year + (root.track-year != "" && root.track-genre != "" ? " · " : "") + root.track-genre + ((root.track-year != "" || root.track-genre != "") && root.track-position-label != "" ? " · " : "") + root.track-position-label;
+                            color: #888888;
+                            font-size: 12px;
+                            overflow: elide;
+                        }
+
+                        Text {
+                            text: root.track-composer;
+                            color: #777777;
+                            font-size: 11px;
+                            overflow: elide;
+                        }
+
+                        Text {
+                            text: root.mb-status;
+                            color: #6699cc;
+                            font-size: 10px;
+                            overflow: elide;
+                        }
+
+                        Text {
+                            text: root.current-file;
+                            color: #666666;
+                            font-size: 11px;
+                            overflow: elide;
+                        }
+
+                        Text {
+                            text: root.file-info;
+                            color: #888888;
+                            font-size: 11px;
+                        }
+
+                        Text {
+                            text: root.playback-info;
+                            color: #00cc66;
+                            font-size: 10px;
+                            font-family: "monospace";
+                        }
+                    }
+
+                    Rectangle {
+                        width: 280px;
+                        height: 200px;
+                        background: #222222;
+                        border-radius: 8px;
+                        clip: true;
+
+                        ListView {
+                            width: 100%;
+                            height: 100%;
+                            for track[index] in root.tracks: Rectangle {
+                                height: 38px;
+                                background: index == root.current-track-index ? #3d4a3d : transparent;
+                                border-radius: 4px;
+
+                                HorizontalBox {
+                                    padding: 8px;
+                                    spacing: 8px;
+
+                                    Text {
+                                        text: track.display-number;
+                                        color: #aaaaaa;
+                                        font-size: 12px;
+                                        width: 32px;
+                                        vertical-alignment: center;
+                                    }
+
+                                    Text {
+                                        text: track.title;
+                                        color: #eeeeee;
+                                        font-size: 12px;
+                                        horizontal-stretch: 1;
+                                        overflow: elide;
+                                        vertical-alignment: center;
+                                    }
+
+                                    Text {
+                                        text: track.duration-text;
+                                        color: #888888;
+                                        font-size: 11px;
+                                        width: 44px;
+                                        horizontal-alignment: right;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                TouchArea {
+                                    width: 100%;
+                                    height: 100%;
+                                    clicked => {
+                                        root.play-track(index);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 56px;
+
+                    VerticalBox {
+                        PlaybackProgress {
+                            position: root.position;
+                            duration: root.duration;
+                            seek(value) => {
+                                root.seek(value);
+                            }
+                        }
+
+                        HorizontalBox {
+                            Text {
+                                text: format-time(root.position);
+                                color: #cccccc;
+                                font-size: 11px;
+                                width: 50px;
+                            }
+
+                            Rectangle { }
+
+                            Text {
+                                text: format-time(root.duration);
+                                color: #cccccc;
+                                font-size: 11px;
+                                horizontal-alignment: right;
+                                width: 50px;
+                            }
+                        }
+                    }
+                }
+
+                HorizontalBox {
+                    spacing: 10px;
+                    alignment: center;
+
+                    Button {
+                        text: "Load File";
+                        clicked => {
+                            root.load-file();
+                        }
+                        primary: true;
+                    }
+
+                    IconButton {
+                        icon: @image-url("../../assets/icons/skip-back.svg");
+                        clicked => {
+                            root.prev-track();
+                        }
+                        enabled: root.current-file != "No file loaded";
+                    }
+
+                    Button {
+                        text: root.is-playing ? "⏸" : "▶";
+                        width: 60px;
+                        clicked => {
+                            if (root.is-playing) {
+                                root.pause();
+                            } else {
+                                root.play();
+                            }
+                        }
+                        enabled: root.current-file != "No file loaded";
+                    }
+
+                    Button {
+                        text: "⏹";
+                        width: 60px;
+                        clicked => {
+                            root.stop();
+                        }
+                        enabled: root.current-file != "No file loaded";
+                    }
+
+                    IconButton {
+                        icon: @image-url("../../assets/icons/skip-forward.svg");
+                        clicked => {
+                            root.next-track();
+                        }
+                        enabled: root.current-file != "No file loaded";
+                    }
+                }
+
+                GridBox {
+                    Row {
+                        Text {
+                            text: "Output Device:";
+                            color: #cccccc;
+                            vertical-alignment: center;
+                            col: 0;
+                        }
+
+                        ComboBox {
+                            model: root.audio-devices;
+                            current-index: root.selected-device;
+                            current-value: root.audio-devices[root.selected-device];
+                            selected(value) => {
+                                root.device-changed(value);
+                            }
+                            col: 1;
+                            colspan: 2;
+                        }
+                    }
+
+                    Row {
+                        Text {
+                            text: "Volume:";
+                            color: #cccccc;
+                            vertical-alignment: center;
+                            col: 0;
+                        }
+
+                        Slider {
+                            value: root.volume;
+                            minimum: 0.0;
+                            maximum: 1.0;
+                            changed(value) => {
+                                root.volume-changed(value);
+                            }
+                            col: 1;
+                        }
+
+                        Text {
+                            text: Math.round(root.volume * 100) + "%";
+                            color: #cccccc;
+                            horizontal-alignment: right;
+                            width: 40px;
+                            col: 2;
+                        }
+                    }
+                }
+
+                Rectangle { }
+            }
+
+            if root.active-view == 1: VerticalBox {
+                padding: 16px;
+                spacing: 10px;
+
+                HorizontalBox {
+                    spacing: 12px;
+                    alignment: center;
+
                     Text {
-                        text: format-time(root.position);
-                        color: #cccccc;
-                        font-size: 11px;
-                        width: 50px;
+                        text: "Albums";
+                        color: #ffffff;
+                        font-size: 22px;
+                        font-weight: 700;
+                        horizontal-stretch: 1;
                     }
-                    
-                    Rectangle { }
-                    
-                    Text {
-                        text: format-time(root.duration);
-                        color: #cccccc;
-                        font-size: 11px;
-                        horizontal-alignment: right;
-                        width: 50px;
+
+                    Button {
+                        text: "Add music folder";
+                        clicked => {
+                            root.scan-music-library();
+                        }
+                        primary: true;
+                    }
+                }
+
+                Text {
+                    text: "Gallery uses embedded art and folder images. Missing covers load from MusicBrainz + Cover Art Archive (free). Respect MB rate limits when scanning large libraries.";
+                    color: #888888;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+
+                ListView {
+                    vertical-stretch: 1;
+                    width: 100%;
+                    for row in root.album-rows: HorizontalBox {
+                            padding-bottom: 12px;
+                            spacing: 12px;
+
+                        AlbumTile {
+                            data: row.c0;
+                            picked(idx) => {
+                                root.open-album(idx);
+                            }
+                        }
+
+                        AlbumTile {
+                            data: row.c1;
+                            picked(idx) => {
+                                root.open-album(idx);
+                            }
+                        }
+
+                        AlbumTile {
+                            data: row.c2;
+                            picked(idx) => {
+                                root.open-album(idx);
+                            }
+                        }
+
+                        AlbumTile {
+                            data: row.c3;
+                            picked(idx) => {
+                                root.open-album(idx);
+                            }
+                        }
                     }
                 }
             }
         }
-        
-        // Control buttons
-        HorizontalBox {
-            spacing: 10px;
-            alignment: center;
-            
-            Button {
-                text: "Load File";
-                clicked => { root.load-file(); }
-                primary: true;
-            }
-            
-            Button {
-                text: root.is-playing ? "⏸" : "▶";
-                width: 60px;
-                clicked => { 
-                    if (root.is-playing) {
-                        root.pause();
-                    } else {
-                        root.play();
-                    }
-                }
-                enabled: root.current-file != "No file loaded";
-            }
-            
-            Button {
-                text: "⏹";
-                width: 60px;
-                clicked => { root.stop(); }
-                enabled: root.current-file != "No file loaded";
-            }
-        }
-        
-        // Device and volume controls
-        GridBox {
-            Row {
-                Text {
-                    text: "Output Device:";
-                    color: #cccccc;
-                    vertical-alignment: center;
-                    col: 0;
-                }
-                
-                ComboBox {
-                    model: root.audio-devices;
-                    current-index: root.selected-device;
-                    current-value: root.audio-devices[root.selected-device];
-                    selected(value) => { root.device-changed(value); }
-                    col: 1;
-                    colspan: 2;
-                }
-            }
-            
-            Row {
-                Text {
-                    text: "Volume:";
-                    color: #cccccc;
-                    vertical-alignment: center;
-                    col: 0;
-                }
-                
-                Slider {
-                    value: root.volume;
-                    minimum: 0.0;
-                    maximum: 1.0;
-                    changed(value) => { root.volume-changed(value); }
-                    col: 1;
-                }
-                
-                Text {
-                    text: Math.round(root.volume * 100) + "%";
-                    color: #cccccc;
-                    horizontal-alignment: right;
-                    width: 40px;
-                    col: 2;
-                }
-            }
-        }
-        
-        Rectangle { }
     }
-    
+
     function format-time(seconds: float) -> string {
-        if (seconds < 0) { return "0:00"; }
-        return Math.floor(seconds / 60) + ":" + 
-               (Math.floor(Math.mod(seconds, 60)) < 10 ? "0" : "") + 
-               Math.floor(Math.mod(seconds, 60));
+        if (seconds < 0) {
+            return "0:00";
+        }
+        return Math.floor(seconds / 60) + ":" + (Math.floor(Math.mod(seconds, 60)) < 10 ? "0" : "") + Math.floor(Math.mod(seconds, 60));
     }
 }
